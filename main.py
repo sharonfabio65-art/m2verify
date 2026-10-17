@@ -317,9 +317,9 @@ class DeveloperTypingBot:
         "script.js": "[javascript]",
     }
 
-    CURSOR_MOVE_INTERVAL = 20
+    CURSOR_MOVE_INTERVAL = 15
     CURSOR_MOVE_DURATION = 3
-    BROWSER_REFRESH_INTERVAL = 30
+    BROWSER_REFRESH_INTERVAL = 40
     BROWSER_REFRESH_WAIT = 1
 
     # Checkpoint = save + read back from disk + exact comparison.
