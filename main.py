@@ -52,6 +52,7 @@ KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
 SW_RESTORE = 9
+SW_MINIMIZE = 6
 
 VK_BACK = 0x08
 VK_TAB = 0x09
@@ -59,8 +60,11 @@ VK_RETURN = 0x0D
 VK_SHIFT = 0x10
 VK_CONTROL = 0x11
 VK_MENU = 0x12
+VK_LEFT = 0x25
+VK_RIGHT = 0x27
 VK_END = 0x23
 VK_HOME = 0x24
+VK_NONE = 0xE8          # unassigned key; used only to nudge input focus
 VK_F5 = 0x74
 VK_LWIN = 0x5B
 VK_RWIN = 0x5C
@@ -68,7 +72,7 @@ VK_1 = 0x31
 VK_A = 0x41
 VK_P = 0x50
 VK_S = 0x53
-EXTENDED_VKS = {VK_END, VK_HOME}
+EXTENDED_VKS = {VK_END, VK_HOME, VK_LEFT, VK_RIGHT}
 
 ULONG_PTR = ctypes.c_size_t
 
@@ -293,6 +297,26 @@ def first_difference(a, b):
     return limit
 
 
+# Typing a closing bracket as the first thing on a line makes VS Code
+# re-indent that line to match the line of its opening bracket ("electric
+# character"), silently changing the source's indentation. These are the
+# tokens that trigger it (html/css/js language configurations).
+ELECTRIC_TOKENS = ("-->", "}", ")", "]")
+
+
+def line_prefix_is_blank(text, index):
+    """True if only spaces/tabs precede `index` on its line."""
+    start = text.rfind("\n", 0, index) + 1
+    return text[start:index].strip(" \t") == ""
+
+
+def electric_token_at(text, index):
+    for token in ELECTRIC_TOKENS:
+        if text.startswith(token, index):
+            return token
+    return None
+
+
 def sha256_text(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -317,15 +341,20 @@ class DeveloperTypingBot:
         "script.js": "[javascript]",
     }
 
-    CURSOR_MOVE_INTERVAL = 15
-    CURSOR_MOVE_DURATION = 3
-    BROWSER_REFRESH_INTERVAL = 40
-    BROWSER_REFRESH_WAIT = 1
+    CURSOR_MOVE_INTERVAL = 20
+    CURSOR_MOVE_DURATION = 2
+    BROWSER_REFRESH_INTERVAL = 50
+    BROWSER_REFRESH_WAIT = 5
 
     # Checkpoint = save + read back from disk + exact comparison.
     SAVE_EVERY_CHARACTERS = 25
     SAVE_VERIFY_TIMEOUT = 4.0
     SAVE_VERIFY_ATTEMPTS = 3
+    # A file that differs from the expected text only counts as 'diverged'
+    # once that same content has been stable this long. Right after a save
+    # (especially after deleting text) the disk still holds the OLD content
+    # for a moment, which must not be mistaken for a typing error.
+    DIVERGE_SETTLE_SECONDS = 2.0
     MAX_FOCUS_FAILURES = 5
 
     # Starts VS Code without third-party extensions (auto-close-tag,
@@ -334,7 +363,17 @@ class DeveloperTypingBot:
 
     # Typed and erased before every file to prove the right editor has
     # keyboard focus and that nothing auto-closes or auto-indents.
-    CANARY = "<a href=\"x?a=1&b=2\">{[('`\u20ac\U0001F600\n\t;"
+    # The last lines deliberately put closing brackets on their own,
+    # mis-indented lines: VS Code would re-indent them if the workaround
+    # in type_closing_token() were not working.
+    CANARY = (
+        "<a href=\"x?a=1&b=2\">{[('`\u20ac\U0001F600\n\t;"
+        "\n  x {\n      }\n<!--\n  -->"
+    )
+
+    # Temporary non-whitespace character typed before a line-leading
+    # closing bracket so VS Code's electric re-indent does not fire.
+    ELECTRIC_PLACEHOLDER = "x"
 
     # Typed and erased to prove the TEXT EDITOR (not the terminal, Quick
     # Open or another control) has keyboard focus after any interruption.
@@ -374,6 +413,7 @@ class DeveloperTypingBot:
         self.last_error = None
         self.preserve_evidence = False
         self.sources_changed = []
+        self.file_status = {}
 
         # Worker/listener threads never touch Tk directly; they post here.
         self.ui_queue = queue.Queue()
@@ -872,6 +912,7 @@ class DeveloperTypingBot:
             self.last_error = None
             self.preserve_evidence = False
             self.sources_changed = []
+            self.file_status = {n: "INCOMPLETE" for n in self.FILE_ORDER}
             self.vscode_hwnd = None
             self.current_filename = None
             self.current_index = 0
@@ -1008,17 +1049,46 @@ class DeveloperTypingBot:
             return False
         if self.foreground_hwnd() != hwnd:
             return False
+        return self.title_shows(filename)
+
+    def title_shows(self, filename):
+        """Our VS Code window's title names `filename` as the active
+        editor (foreground state is NOT checked here)."""
+        hwnd = self.vscode_hwnd
+        if not hwnd or _user32 is None or self.workspace is None:
+            return False
         info = parse_title(get_window_title(hwnd))
-        if info is None or self.workspace is None:
+        if info is None:
             return False
         return (
             info["root"].lower() == self.workspace.name.lower()
             and info["file"].lower() == filename.lower()
         )
 
+    def _attach_and_focus(self, hwnd):
+        current = _kernel32.GetCurrentThreadId()
+        fg = self.foreground_hwnd()
+        fg_thread = _user32.GetWindowThreadProcessId(fg, None) if fg else 0
+        attached = False
+        if fg_thread and fg_thread != current:
+            attached = bool(
+                _user32.AttachThreadInput(current, fg_thread, True)
+            )
+        try:
+            _user32.BringWindowToTop(hwnd)
+            _user32.SetForegroundWindow(hwnd)
+        finally:
+            if attached:
+                _user32.AttachThreadInput(current, fg_thread, False)
+        time.sleep(0.3)
+
     def force_foreground(self, hwnd):
-        """Bring a window forward WITHOUT tapping Alt (an Alt tap focuses
-        VS Code's menu bar, so typed letters would trigger menu keys)."""
+        """
+        Bring a window forward WITHOUT tapping Alt (an Alt tap focuses
+        VS Code's menu bar, so typed letters would trigger menu keys).
+        Escalates: plain attach/SetForegroundWindow, then an input nudge
+        with an unassigned key, then a minimize/restore cycle.
+        """
         try:
             if _user32.IsIconic(hwnd):
                 _user32.ShowWindow(hwnd, SW_RESTORE)
@@ -1026,25 +1096,21 @@ class DeveloperTypingBot:
             if self.foreground_hwnd() == hwnd:
                 return True
 
-            current = _kernel32.GetCurrentThreadId()
-            fg = self.foreground_hwnd()
-            fg_thread = (
-                _user32.GetWindowThreadProcessId(fg, None) if fg else 0
-            )
-            attached = False
-            if fg_thread and fg_thread != current:
-                attached = bool(
-                    _user32.AttachThreadInput(current, fg_thread, True)
-                )
-            try:
-                _user32.BringWindowToTop(hwnd)
-                _user32.SetForegroundWindow(hwnd)
-            finally:
-                if attached:
-                    _user32.AttachThreadInput(current, fg_thread, False)
-
-            time.sleep(0.3)
-            return self.foreground_hwnd() == hwnd
+            for method in range(3):
+                if method == 1:
+                    try:
+                        send_vk(VK_NONE)
+                    except OSError:
+                        pass
+                elif method == 2:
+                    _user32.ShowWindow(hwnd, SW_MINIMIZE)
+                    time.sleep(0.3)
+                    _user32.ShowWindow(hwnd, SW_RESTORE)
+                    time.sleep(0.3)
+                self._attach_and_focus(hwnd)
+                if self.foreground_hwnd() == hwnd:
+                    return True
+            return False
         except Exception as error:
             self.log(f"force_foreground failed: {error}")
             return False
@@ -1115,21 +1181,24 @@ class DeveloperTypingBot:
     def wait_for_disk(self, filename, expected, timeout):
         """
         Poll the file until it equals `expected`. Returns (state, actual):
-        'equal', 'behind' (still a prefix after the timeout), 'diverged',
-        or 'unreadable'. 'diverged' must persist across two reads so a
-        half-written file is not misreported.
+        'equal', 'behind' (still a proper prefix after the timeout),
+        'diverged', or 'unreadable'. 'diverged' is only returned once the
+        same differing content has been stable for DIVERGE_SETTLE_SECONDS
+        (or the timeout ends), so a save that has not landed yet is never
+        reported as a typing error.
         """
         # A BOM-only expectation also accepts a truly empty file, because
         # an empty file may be written with or without the BOM.
         accept_empty = expected == "\ufeff"
         end = time.monotonic() + timeout
-        diverged_reads = 0
         state, actual = "unreadable", None
+        stable_actual, stable_since = None, 0.0
         while True:
             actual = self.read_disk(filename)
+            now = time.monotonic()
             if actual is None:
                 state = "unreadable"
-                diverged_reads = 0
+                stable_actual = None
             elif accept_empty and actual == "":
                 return "equal", actual
             else:
@@ -1137,12 +1206,13 @@ class DeveloperTypingBot:
                 if state == "equal":
                     return state, actual
                 if state == "diverged":
-                    diverged_reads += 1
-                    if diverged_reads >= 2:
+                    if actual != stable_actual:
+                        stable_actual, stable_since = actual, now
+                    elif now - stable_since >= self.DIVERGE_SETTLE_SECONDS:
                         return state, actual
                 else:
-                    diverged_reads = 0
-            if time.monotonic() >= end:
+                    stable_actual = None
+            if now >= end:
                 return state, actual
             time.sleep(0.05)
 
@@ -1187,8 +1257,9 @@ class DeveloperTypingBot:
     def save_and_verify(self, filename, expected, timeout=None):
         """
         Save and require the disk to equal `expected`. A save that is merely
-        slow ('behind'/'unreadable') is retried; content that differs
-        ('diverged') fails immediately without further typing.
+        slow ('behind'/'unreadable') or not yet reflected is retried; content
+        that still differs after a second save ('diverged') fails without
+        further typing.
         """
         timeout = timeout or self.SAVE_VERIFY_TIMEOUT
         state, actual = "unreadable", None
@@ -1201,11 +1272,11 @@ class DeveloperTypingBot:
             state, actual = self.wait_for_disk(filename, expected, timeout)
             if state == "equal":
                 return
-            if state == "diverged":
+            if state == "diverged" and attempt >= 2:
                 break
             self.log(
-                f"{filename}: save not yet reflected on disk ({state}); "
-                f"retry {attempt}/{self.SAVE_VERIFY_ATTEMPTS}."
+                f"{filename}: disk not yet as expected ({state}); "
+                f"saving again {attempt}/{self.SAVE_VERIFY_ATTEMPTS}."
             )
         raise VerificationError(
             self.report_mismatch(filename, expected, actual, state)
@@ -1225,12 +1296,16 @@ class DeveloperTypingBot:
         return self.fast_focus_ok(filename)
 
     def _wait_for_editor(self, filename, seconds):
+        """Wait until `filename` is the active editor of our window, and
+        bring that window to the foreground if it is not there yet."""
         end = time.monotonic() + seconds
         while time.monotonic() < end:
             if self.stop_event.is_set():
                 return False
-            if self.fast_focus_ok(filename):
-                return True
+            if self.title_shows(filename):
+                if self.fast_focus_ok(filename):
+                    return True
+                self.force_foreground(self.vscode_hwnd)
             time.sleep(0.2)
         return False
 
@@ -1280,21 +1355,28 @@ class DeveloperTypingBot:
         return self._wait_for_editor(filename, 8.0)
 
     def open_target(self, filename):
-        for attempt in range(1, 4):
+        """
+        Open `filename` in our workspace window. The VS Code CLI is tried
+        first (it needs no keystrokes and worked reliably in testing),
+        then Quick Open, then the CLI again.
+        """
+        methods = ("cli", "quick", "cli")
+        for attempt, method in enumerate(methods, start=1):
             if self.stop_event.is_set():
                 return
-            if not self.activate_vscode():
-                self.log(f"open_target: cannot activate window "
-                         f"(attempt {attempt}/3)")
-                time.sleep(0.5)
-                continue
 
-            if self.fast_focus_ok(filename):
-                opened = True
-            elif attempt == 2:
-                self.log(f"Opening {filename} via CLI (attempt 2/3).")
+            if self.title_shows(filename):
+                opened = self._wait_for_editor(filename, 5.0)
+            elif method == "cli":
+                self.log(f"Opening {filename} via CLI "
+                         f"(attempt {attempt}/3).")
                 opened = self._cli_open(filename)
             else:
+                if not self.activate_vscode():
+                    self.log(f"Cannot activate window for Quick Open "
+                             f"(attempt {attempt}/3).")
+                    time.sleep(0.5)
+                    continue
                 self.log(f"Opening {filename} via Quick Open "
                          f"(attempt {attempt}/3).")
                 opened = self._quick_open(filename)
@@ -1321,6 +1403,43 @@ class DeveloperTypingBot:
         else:
             send_unicode_char(character)
 
+    def type_closing_token(self, token):
+        """
+        Type a closing bracket token (e.g. "}") that starts a line WITHOUT
+        triggering VS Code's electric re-indent, which only fires when the
+        text before the bracket is blank. A placeholder is typed first, the
+        token follows, then the placeholder is removed:
+            x}  ->  (Left x len)  ->  Backspace  ->  (Right x len)
+        """
+        self.type_char(self.ELECTRIC_PLACEHOLDER)
+        for ch in token:
+            self.type_char(ch)
+        time.sleep(0.03)
+        for _ in token:
+            send_vk(VK_LEFT)
+            time.sleep(0.02)
+        send_vk(VK_BACK)
+        time.sleep(0.02)
+        for _ in token:
+            send_vk(VK_RIGHT)
+            time.sleep(0.02)
+
+    def type_step(self, text, index):
+        """Type the next unit of `text` at `index` and return the new
+        index: one character, a CRLF pair (as one Enter), or a line-leading
+        closing bracket token."""
+        if line_prefix_is_blank(text, index):
+            token = electric_token_at(text, index)
+            if token:
+                self.type_closing_token(token)
+                return index + len(token)
+        char = text[index]
+        if char == "\r":
+            self.type_char("\n")
+            return index + 2
+        self.type_char(char)
+        return index + 1
+
     def canary_test(self, filename):
         """
         Before the first real character: type a punctuation/Unicode canary,
@@ -1344,39 +1463,25 @@ class DeveloperTypingBot:
 
         self.set_status(f"Pre-flight check for {filename}...")
         self.log(f"Canary test start: {filename}")
-        for ch in self.CANARY:
+        i = 0
+        while i < len(self.CANARY):
             if self.stop_event.is_set():
                 return
             if not self.fast_focus_ok(filename):
                 raise RuntimeError("Lost editor focus during pre-flight.")
             self.wait_modifiers_released()
-            self.type_char(ch)
+            i = self.type_step(self.CANARY, i)
             time.sleep(0.05)
 
         self.save_and_verify(filename, canary_on_disk, timeout=8.0)
         self.log("Canary typed and verified exactly on disk.")
 
-        for _ in range(len(self.CANARY)):
-            if not self.fast_focus_ok(filename):
-                raise RuntimeError("Lost editor focus during pre-flight.")
-            send_vk(VK_BACK)
-            time.sleep(0.05)
-
-        self.save_active_file(filename)
-        state, actual = self.wait_for_disk(filename, empty, 3.0)
-        if state != "equal":
-            # The file held ONLY the canary, so select-all + delete is safe.
-            self.log("Canary erase left residue; trying Ctrl+A, Backspace.")
-            send_chord(VK_CONTROL, VK_A)
-            time.sleep(0.1)
-            send_vk(VK_BACK)
-            time.sleep(0.2)
-            self.save_active_file(filename)
-            state, actual = self.wait_for_disk(filename, empty, 3.0)
-            if state != "equal":
-                raise VerificationError(self.report_mismatch(
-                    filename, empty, actual, state
-                ))
+        # The file holds ONLY the canary, so select-all + delete is safe.
+        send_chord(VK_CONTROL, VK_A)
+        time.sleep(0.15)
+        send_vk(VK_BACK)
+        time.sleep(0.2)
+        self.save_and_verify(filename, empty)
         self.log("Canary erased; file is empty and verified.")
 
         if not self.place_cursor_at_end(filename):
@@ -1680,12 +1785,10 @@ class DeveloperTypingBot:
                 last_checkpoint = index
                 continue
 
-            # CRLF sources: one Enter produces the CRLF (files.eol is CRLF
-            # for that language), so the pair is consumed as one key.
-            step = 2 if char == "\r" else 1
-            self.type_char("\n" if char == "\r" else char)
-
-            index += step
+            # One step = one character, a CRLF pair (typed as one Enter;
+            # files.eol is CRLF for that language), or a line-leading
+            # closing bracket typed with the electric re-indent workaround.
+            index = self.type_step(source, index)
             self.current_index = index
 
             if (
@@ -1744,6 +1847,7 @@ class DeveloperTypingBot:
                 self.last_error = message
                 failures.append(message)
             else:
+                self.file_status[name] = "PASS"
                 self.log(
                     f"BYTE-IDENTICAL: {name} sha256={saved_hash}"
                 )
@@ -1857,6 +1961,8 @@ class DeveloperTypingBot:
 
         except VerificationError as error:
             self.stop_event.set()
+            if self.file_status.get(self.current_filename) != "PASS":
+                self.file_status[self.current_filename] = "FAILED"
             error_to_show = (
                 "VERIFICATION FAILED - the saved file does not match the "
                 "source. The workspace was preserved for investigation.\n\n"
@@ -1884,13 +1990,35 @@ class DeveloperTypingBot:
                 self.sources_changed = self.check_sources_unmodified()
                 if self.sources_changed:
                     self.log(
-                        "WARNING: source files changed during the run: "
+                        "FAILED - source files changed during the run: "
                         f"{self.sources_changed}"
                     )
+                    if completed:
+                        completed = False
+                        error_to_show = (
+                            "FAILED - source changed during the run: "
+                            + ", ".join(self.sources_changed)
+                        )
                 else:
                     self.log("Original source files unmodified (hash match).")
             except Exception as error:
                 self.log(f"Source hash check failed: {error}")
+
+            if (
+                not completed
+                and error_to_show is None
+                and time.monotonic() >= deadline
+            ):
+                error_to_show = (
+                    "INCOMPLETE - the time limit was reached before all "
+                    "files were typed and verified."
+                )
+
+            for name in self.FILE_ORDER:
+                self.log(
+                    f"REPORT {name}: "
+                    f"{self.file_status.get(name, 'INCOMPLETE')}"
+                )
 
             self.running = False
             self.ui_queue.put(("finish", completed, error_to_show))
