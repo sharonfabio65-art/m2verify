@@ -42,7 +42,7 @@ from pynput import keyboard
 
 
 # ==================================================================
-#804949 Low-level Windows keyboard input (SendInput)  https://www.unifiedremote.com/download/windows-setup
+# Low-level Windows keyboard input (SendInput)
 # ==================================================================
 
 IS_WINDOWS = sys.platform == "win32"
@@ -343,8 +343,8 @@ class DeveloperTypingBot:
 
     CURSOR_MOVE_INTERVAL = 20
     CURSOR_MOVE_DURATION = 2
-    BROWSER_REFRESH_INTERVAL = 50
-    BROWSER_REFRESH_WAIT = 5
+    BROWSER_REFRESH_INTERVAL = 40
+    BROWSER_REFRESH_WAIT = 10
 
     # Checkpoint = save + read back from disk + exact comparison.
     SAVE_EVERY_CHARACTERS = 25
